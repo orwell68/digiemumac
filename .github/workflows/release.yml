@@ -1,9 +1,11 @@
 name: Release
 
-# Pushing a tag vX.Y.Z builds the Windows zip on a Windows runner, from
-# source (the patched Unicorn included). It runs tools/build-windows.ps1's
-# checks and frozen self-test, then attaches the zip and SHA256SUMS.txt to a
-# DRAFT release for the tag. Publishing stays a person's decision.
+# Pushing a tag vX.Y.Z builds the Windows zip on a Windows runner and the
+# macOS (Apple Silicon) zip on a macOS runner, each from source (the patched
+# Unicorn included). Each runs its build script's checks and frozen
+# self-test (tools/build-windows.ps1, tools/build-macos.sh), then the zips
+# and one SHA256SUMS.txt are attached to a DRAFT release for the tag.
+# Publishing stays a person's decision.
 #
 # The tag must match APP_VERSION in emu/portable.py (tools/ci/release_version.py):
 # bump it in a pull request, merge, then tag the merge commit. Notes come from
@@ -25,7 +27,9 @@ on:
       - 'requirements.txt'
       - 'requirements-build.txt'
       - 'tools/build-windows.ps1'
+      - 'tools/build-macos.sh'
       - 'tools/install-patched-unicorn.ps1'
+      - 'tools/install-patched-unicorn.sh'
       - 'tools/ci/release_version.py'
   workflow_dispatch:
 
@@ -130,9 +134,122 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  build-macos:
+    name: macos-build
+    # macos-14 and later are Apple Silicon (arm64). An Intel zip would need
+    # a second run of the same steps on an Intel runner.
+    runs-on: macos-14
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # python.org's build, whose tkinter carries its own Tcl/Tk frameworks
+      # (PyInstaller bundles them). requires-python pins 3.12.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Version (a tag must match APP_VERSION)
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            v=$(python tools/ci/release_version.py --tag "$GITHUB_REF_NAME")
+          else
+            v=$(python tools/ci/release_version.py)
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "building digiemu $v"
+
+      - name: Project venv
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --quiet -r requirements.txt
+
+      # From source every time: the release carries exactly the patches in
+      # this commit. install-patched-unicorn.sh checks each patch's SHA-256
+      # and Unicorn's pinned commit, then runs emu.unicorn_compat.
+      - name: Patched Unicorn (clang)
+        run: PYTHON=.venv/bin/python bash tools/install-patched-unicorn.sh
+
+      - name: Build, self-test, audit and zip
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          bash tools/build-macos.sh --build-venv "$RUNNER_TEMP/bv" --out "$RUNNER_TEMP/out" \
+            --version "${{ steps.version.outputs.version }}" 2>&1 | tee "$RUNNER_TEMP/out/build-macos.log"
+
+      # The job log is only readable in a browser, so a failed build also
+      # reports itself where the API can show it: as error annotations and,
+      # on a pull request, as a comment with the tail of the build log.
+      - name: Report a failed build
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          out="$RUNNER_TEMP/out"
+          {
+            echo '## macos-build failed'
+            echo
+            echo '```'
+            tail -n 60 "$out/build-macos.log" 2>/dev/null || echo '(no build-macos.log)'
+            echo '```'
+            for f in "$out"/selftest-*.err "$out"/pyinstaller.log; do
+              [ -f "$f" ] || continue
+              echo
+              echo "**$(basename "$f")** (lines with ERROR/Traceback/FAILED, and the last 15):"
+              echo '```'
+              grep -nE 'ERROR|Traceback|Error|FAILED|refusing|SystemExit' "$f" | tail -n 30
+              echo '...'
+              tail -n 15 "$f"
+              echo '```'
+            done
+          } > "$out/failure.md"
+          tail -n 20 "$out/build-macos.log" 2>/dev/null | while IFS= read -r line; do echo "::error::$line"; done
+          if [ -n "$PR" ]; then
+            gh pr comment "$PR" --body-file "$out/failure.md" || true
+          fi
+
+      - name: Checksum and build info
+        run: |
+          set -euo pipefail
+          v='${{ steps.version.outputs.version }}'
+          out="$RUNNER_TEMP/out"
+          zip="digiemu-macos-arm64-$v.zip"
+          h=$(shasum -a 256 "$out/$zip" | awk '{print $1}')
+          printf '%s *%s\n' "$h" "$zip" > "$out/SHA256SUMS-macos.txt"
+          printf 'runner=%s %s\n' "$ImageOS" "$ImageVersion" >> "$out/build-info.txt"
+          mv "$out/build-info.txt" "$out/build-info-macos.txt"
+          cat "$out/SHA256SUMS-macos.txt" "$out/build-info-macos.txt"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digiemu-macos-arm64-${{ steps.version.outputs.version }}
+          path: |
+            ${{ runner.temp }}/out/digiemu-macos-*.zip
+            ${{ runner.temp }}/out/SHA256SUMS-macos.txt
+            ${{ runner.temp }}/out/build-info-macos.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Keep the build logs of a failed build
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-macos
+          path: |
+            ${{ runner.temp }}/out/*.log
+            ${{ runner.temp }}/out/selftest-*
+            ${{ runner.temp }}/out/work/digiemu/warn-digiemu.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
   release:
     name: draft-release
-    needs: build
+    needs: [build, build-macos]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -146,6 +263,11 @@ jobs:
           name: digiemu-win64-${{ needs.build.outputs.version }}
           path: dist
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: digiemu-macos-arm64-${{ needs.build-macos.outputs.version }}
+          path: dist
+
       - name: Draft the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -154,8 +276,12 @@ jobs:
         run: |
           set -euo pipefail
           zip="dist/digiemu-win64-$VERSION.zip"
+          mac="dist/digiemu-macos-arm64-$VERSION.zip"
           dll=$(sed -n 's/^unicorn_dll_sha256=//p' dist/build-info.txt)
           py=$(sed -n 's/^python=//p' dist/build-info.txt)
+          dylib=$(sed -n 's/^unicorn_source_sha256=//p' dist/build-info-macos.txt)
+          pymac=$(sed -n 's/^python=//p' dist/build-info-macos.txt)
+          cat dist/SHA256SUMS-macos.txt >> dist/SHA256SUMS.txt
           run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           {
             if [ -f "docs/releases/$TAG.md" ]; then
@@ -172,17 +298,17 @@ jobs:
             echo
             echo '## Build'
             echo
-            echo "Built by GitHub Actions from tag \`$TAG\` (commit \`${GITHUB_SHA:0:7}\`) with \`tools/build-windows.ps1\` on Python $py ([the run]($run)). The bundled \`unicorn.dll\` (SHA-256 \`$dll\`) is Unicorn 2.1.4 with the patches in \`patches/\`, built from source on the runner. **No Elektron firmware is included.** digiemu is not affiliated with or endorsed by Elektron."
+            echo "Built by GitHub Actions from tag \`$TAG\` (commit \`${GITHUB_SHA:0:7}\`) ([the run]($run)): the Windows zip with \`tools/build-windows.ps1\` on Python $py, the macOS (Apple Silicon) zip with \`tools/build-macos.sh\` on Python $pymac. The bundled \`unicorn.dll\` (SHA-256 \`$dll\`) and \`libunicorn.2.dylib\` (built from source with SHA-256 \`$dylib\`, then ad-hoc signed inside the app) are Unicorn 2.1.4 with the patches in \`patches/\`, built from source on the runners. **No Elektron firmware is included.** digiemu is not affiliated with or endorsed by Elektron."
           } > notes.md
           if gh release view "$TAG" --json isDraft --jq .isDraft > draft.txt 2>/dev/null; then
             if [ "$(cat draft.txt)" != true ]; then
               echo "release $TAG is already published; not replacing its files" >&2
               exit 1
             fi
-            gh release upload "$TAG" "$zip" dist/SHA256SUMS.txt --clobber
+            gh release upload "$TAG" "$zip" "$mac" dist/SHA256SUMS.txt --clobber
             echo "updated the files of draft release $TAG"
           else
-            gh release create "$TAG" "$zip" dist/SHA256SUMS.txt \
+            gh release create "$TAG" "$zip" "$mac" dist/SHA256SUMS.txt \
               --draft --verify-tag --title "digiemu $VERSION" --notes-file notes.md
             echo "drafted release $TAG"
           fi

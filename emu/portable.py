@@ -274,15 +274,43 @@ def bundle_dir():
     return REPO
 
 
+def mac_app_bundle(executable=None):
+    """-> the digiemu.app folder this frozen executable runs from, or None.
+
+    PyInstaller puts the executables in <name>.app/Contents/MacOS/. Only the
+    frozen macOS app answers; from source, or on any other platform, None."""
+    if not is_frozen() or sys.platform != 'darwin':
+        return None
+    exe = os.path.abspath(executable or sys.executable)
+    macos_dir = os.path.dirname(exe)
+    contents = os.path.dirname(macos_dir)
+    app = os.path.dirname(contents)
+    if (os.path.basename(macos_dir) == 'MacOS' and os.path.basename(contents) == 'Contents'
+            and app.lower().endswith('.app')):
+        return app
+    return None
+
+
+def mac_app_support():
+    """-> ~/Library/Application Support/digiemu, the macOS app's data folder."""
+    return os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', APP_NAME)
+
+
 def app_root(home=None):
     """-> APP_ROOT, absolute. An explicit --home always wins.
 
     Frozen, the data sits next to the exe: that is what makes the folder
-    portable, so no environment variable redirects it. In development
-    $DIGIEMU_HOME does, else <repo>/portable."""
+    portable, so no environment variable redirects it. The macOS app is the
+    exception: an .app bundle is one opaque icon that people drag into
+    /Applications, so its data goes where macOS keeps application data,
+    ~/Library/Application Support/digiemu, and the launcher's folder buttons
+    open it in the Finder. In development $DIGIEMU_HOME does, else
+    <repo>/portable."""
     if home:
         return os.path.abspath(home)
     if is_frozen():
+        if mac_app_bundle():
+            return mac_app_support()
         return os.path.dirname(os.path.abspath(sys.executable))
     env = os.environ.get('DIGIEMU_HOME')
     if env:
@@ -333,7 +361,10 @@ def list_firmware_dirs(home=None):
 
 
 def local_app_home():
-    """-> the fallback home for a read-only exe folder: %LOCALAPPDATA%/digiemu."""
+    """-> the fallback home for a read-only exe folder: %LOCALAPPDATA%/digiemu
+    on Windows, ~/Library/Application Support/digiemu on macOS."""
+    if sys.platform == 'darwin':
+        return mac_app_support()
     base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
     return os.path.join(base, APP_NAME)
 
@@ -373,7 +404,13 @@ def find_folder(name, home=None):
 
 def cli_prefix(home=None):
     """-> how to run this program from a console, for the hints it prints."""
-    if is_frozen():
+    if mac_app_bundle():
+        # The console binary sits beside the windowed one inside the bundle;
+        # spelled out in full because a .app is not on anyone's PATH.
+        prefix = os.path.join(mac_app_bundle(), 'Contents', 'MacOS', 'digiemu-console')
+        if ' ' in prefix:
+            prefix = '"%s"' % prefix
+    elif is_frozen():
         exe = os.path.basename(sys.executable)
         # The windowed digiemu.exe prints nowhere a person would see.
         prefix = 'digiemu-console.exe' if exe.lower() == 'digiemu.exe' else exe
@@ -2618,6 +2655,8 @@ def _launcher_log(home):
 def open_in_explorer(path):
     if os.name == 'nt':
         os.startfile(path)
+    elif sys.platform == 'darwin':
+        subprocess.Popen(['open', path])
     else:
         subprocess.Popen(['xdg-open', path])
 

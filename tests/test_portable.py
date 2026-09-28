@@ -332,6 +332,49 @@ class LayoutTest(Base):
                              os.path.join(os.path.dirname(exe), 'firmware'))
             self.assertEqual(portable.app_root(self.home), self.home)
 
+    def test_frozen_mac_app_keeps_its_data_in_application_support(self):
+        app = os.path.join(self.tmp, 'Applications', 'digiemu.app')
+        exe = os.path.join(app, 'Contents', 'MacOS', 'digiemu')
+        meipass = os.path.join(app, 'Contents', 'Frameworks')
+        support = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'digiemu')
+        os.environ['DIGIEMU_HOME'] = self.home     # ignored when frozen
+        with mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(sys, '_MEIPASS', meipass, create=True), \
+                mock.patch.object(sys, 'executable', exe), \
+                mock.patch.object(sys, 'platform', 'darwin'):
+            self.assertEqual(portable.mac_app_bundle(), app)
+            self.assertEqual(portable.app_root(), support)
+            self.assertEqual(portable.local_app_home(), support)
+            self.assertEqual(portable.firmware_root(), os.path.join(support, 'firmware'))
+            self.assertEqual(portable.bundle_dir(), meipass)
+            self.assertEqual(portable.app_root(self.home), self.home)
+            self.assertEqual(portable.cli_prefix(),
+                             os.path.join(app, 'Contents', 'MacOS', 'digiemu-console'))
+            self.assertIn('digiemu-console --home', portable.cli_prefix(self.home).replace('"', ''))
+        # The same executable name outside an .app (a bare onedir folder on
+        # macOS, or any other platform) is the portable layout as before.
+        bare = os.path.join(self.tmp, 'dist', 'digiemu', 'digiemu')
+        with mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(sys, 'executable', bare), \
+                mock.patch.object(sys, 'platform', 'darwin'):
+            self.assertIsNone(portable.mac_app_bundle())
+            self.assertEqual(portable.app_root(), os.path.dirname(bare))
+        with mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(sys, 'executable', exe), \
+                mock.patch.object(sys, 'platform', 'linux'):
+            self.assertIsNone(portable.mac_app_bundle())
+        self.assertIsNone(portable.mac_app_bundle())    # not frozen
+
+    def test_open_in_explorer_uses_the_platform_opener(self):
+        with mock.patch.object(portable.subprocess, 'Popen') as popen, \
+                mock.patch.object(portable.os, 'name', 'posix'):
+            with mock.patch.object(sys, 'platform', 'darwin'):
+                portable.open_in_explorer('/x/y')
+                popen.assert_called_with(['open', '/x/y'])
+            with mock.patch.object(sys, 'platform', 'linux'):
+                portable.open_in_explorer('/x/y')
+                popen.assert_called_with(['xdg-open', '/x/y'])
+
     def test_slugs(self):
         good = 'dt1-1.53-9bdd44bb'
         self.assertEqual(portable.check_slug(good), good)

@@ -68,9 +68,23 @@ _log = None                     # the launcher.log stream when stdio was None
 _import_module = importlib.import_module    # the tests put a stand-in here
 
 
+def in_mac_app_bundle():
+    """True when this frozen executable runs from <name>.app/Contents/MacOS/
+    (emu.portable.mac_app_bundle has the same test)."""
+    if not getattr(sys, 'frozen', False) or sys.platform != 'darwin':
+        return False
+    macos_dir = os.path.dirname(os.path.abspath(sys.executable))
+    contents = os.path.dirname(macos_dir)
+    return (os.path.basename(macos_dir) == 'MacOS' and os.path.basename(contents) == 'Contents'
+            and os.path.dirname(contents).lower().endswith('.app'))
+
+
 def app_root():
-    """Where the app keeps its data: next to the exe when frozen. In dev it
+    """Where the app keeps its data: next to the exe when frozen, except the
+    macOS app, which uses ~/Library/Application Support/digiemu. In dev it
     is $DIGIEMU_HOME, or <repo>/portable, as in emu.portable."""
+    if in_mac_app_bundle():
+        return os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'digiemu')
     if getattr(sys, 'frozen', False):
         return os.path.dirname(os.path.abspath(sys.executable))
     home = os.environ.get('DIGIEMU_HOME')
@@ -90,12 +104,15 @@ def bundle_dir():
 def _open_log():
     """-> an append-mode UTF-8 line-buffered stream, or None.
 
-    <app root>/logs first; %LOCALAPPDATA%/digiemu/logs if that folder cannot
-    be written (the exe unpacked somewhere read-only)."""
+    <app root>/logs first; %LOCALAPPDATA%/digiemu/logs (Windows) or
+    ~/Library/Logs/digiemu (macOS) if that folder cannot be written (the exe
+    unpacked somewhere read-only)."""
     dirs = [os.path.join(app_root(), 'logs')]
     local = os.environ.get('LOCALAPPDATA')
     if local:
         dirs.append(os.path.join(local, 'digiemu', 'logs'))
+    if sys.platform == 'darwin':
+        dirs.append(os.path.join(os.path.expanduser('~'), 'Library', 'Logs', 'digiemu'))
     for d in dirs:
         path = os.path.join(d, LOG_NAME)
         try:
@@ -112,8 +129,26 @@ def _open_log():
     return None
 
 
-def setup_stdio():
-    """Give print() somewhere to go, in UTF-8. See the module docstring."""
+def _is_devnull(stream):
+    """True when `stream` is an open file on /dev/null: what the Finder (and
+    launchd) give a macOS app for stdout and stderr. Only asked inside the
+    .app; a pipe or a terminal is never /dev/null."""
+    try:
+        st = os.fstat(stream.fileno())
+        null = os.stat(os.devnull)
+    except (OSError, ValueError, AttributeError):
+        return False
+    return (st.st_dev, st.st_ino) == (null.st_dev, null.st_ino)
+
+
+def setup_stdio(argv=()):
+    """Give print() somewhere to go, in UTF-8. See the module docstring.
+
+    A windowed exe on Windows starts with the streams set to None. The
+    macOS app opened from the Finder gets /dev/null instead, which drops
+    everything just as silently, so inside the .app that counts as None
+    too, except for a worker (--worker), whose output the launcher has
+    already routed where it wants it."""
     global _log
     for s in (sys.stdout, sys.stderr):
         if s is not None and hasattr(s, 'reconfigure'):
@@ -121,6 +156,11 @@ def setup_stdio():
                 s.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
             except (OSError, ValueError):
                 pass
+    if in_mac_app_bundle() and '--worker' not in list(argv):
+        if sys.stdout is not None and _is_devnull(sys.stdout):
+            sys.stdout = None
+        if sys.stderr is not None and _is_devnull(sys.stderr):
+            sys.stderr = None
     if sys.stdout is not None and sys.stderr is not None:
         return
     _log = _open_log()
@@ -198,10 +238,10 @@ def _check_unicorn(info):
     out['sha256'] = sha256_of(path) if os.path.isfile(path) else None
     if getattr(sys, 'frozen', False):
         if not _inside(path, bundle_dir()):
-            raise RuntimeError('unicorn.dll loaded from outside the bundle: %r' % path)
+            raise RuntimeError('the Unicorn library loaded from outside the bundle: %r' % path)
         want = (info or {}).get('unicorn_sha256')
         if want and out['sha256'] != want:
-            raise RuntimeError('unicorn.dll sha256 %s, but this build bundled %s'
+            raise RuntimeError('Unicorn library sha256 %s, but this build bundled %s'
                                % (out['sha256'], want))
     return out
 
@@ -220,7 +260,7 @@ def _check_native():
     out = {'options_supported': got, 'budget': native.budget_available(uc),
            'edma': native.edma_available(uc)}
     if got != NATIVE_OPTIONS or not (out['budget'] and out['edma']):
-        raise RuntimeError('unicorn.dll lacks the speed patches: %r' % out)
+        raise RuntimeError('the Unicorn library lacks the speed patches: %r' % out)
     return out
 
 
@@ -232,7 +272,7 @@ def _check_capstone():
     if [g[2] for g in got] != ['nop']:
         raise RuntimeError('capstone decoded 4e71 as %r' % (got,))
     if getattr(sys, 'frozen', False) and not (lib and _inside(lib, bundle_dir())):
-        raise RuntimeError('capstone.dll loaded from outside the bundle: %r' % lib)
+        raise RuntimeError('the capstone library loaded from outside the bundle: %r' % lib)
     return {'version': getattr(capstone, '__version__', None), 'path': lib}
 
 
@@ -367,7 +407,7 @@ def selftest(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
-    setup_stdio()
+    setup_stdio(argv)
     _log_thread_exceptions()
     if argv[:1] == ['--selftest']:
         return selftest(argv[1:])

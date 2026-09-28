@@ -30,13 +30,24 @@ audit() refuses both: an archive that lacks a module the app imports at run
 time (REQUIRED_MODULES), and an exe that still runs under Control Flow Guard
 (clear_guard_cf() explains why Unicorn cannot).
 
+The same audit covers the macOS app (--layout macos; tools/build-macos.sh):
+there dist is digiemu.app, the executables are Contents/MacOS/digiemu and
+digiemu-console, the Unicorn library is
+Contents/Frameworks/unicorn/lib/libunicorn.2.dylib, and the Mach-O check
+replaces the PE one (Control Flow Guard is a Windows matter). PyInstaller
+fills an .app with relative symlinks between Contents/Frameworks and
+Contents/Resources, so that layout accepts a link whose target stays inside
+the bundle, and make_zip() writes it as a link. The Linux layout exists so
+the macOS spec and script can be exercised on a Linux box or in CI.
+
 Stdlib only, plus PyInstaller's archive reader when present, so the tests can
 run it on synthetic trees. CLI:
-    python packaging/bundle_guard.py DIST [--devices DIR] [--unicorn-sha256 HEX]
-                                          [--require-pyz] [--zip OUT.zip]
+    python packaging/bundle_guard.py DIST [--layout windows|macos|linux] [--devices DIR]
+                                          [--unicorn-sha256 HEX] [--require-pyz] [--zip OUT.zip]
 """
 import argparse
 import array
+import collections
 import hashlib
 import os
 import stat
@@ -57,11 +68,49 @@ TOP_LEVEL = EXES + (CONTENTS,)
 UNICORN_DLL = CONTENTS + '/unicorn/lib/unicorn.dll'
 CAPSTONE_DLL = CONTENTS + '/capstone/lib/capstone.dll'
 
+# One bundle shape per platform. Paths are bundle-relative, '/'-separated
+# and lower-case (audit() lower-cases what it finds before comparing).
+#   exes          the executables, each checked with `exe_check`
+#   top_level     what dist may hold at its top
+#   unicorn_lib   the one patched Unicorn library, whose hash the build pins
+#   capstone_libs any one of these must be present
+#   exe_check     'pe' (no Control Flow Guard, right checksum), 'macho', 'elf'
+#   links         whether symlinks are allowed (only ones that stay inside dist)
+Layout = collections.namedtuple(
+    'Layout', 'name exes top_level unicorn_lib unicorn_name capstone_libs exe_check links')
+
+WINDOWS = Layout('windows', EXES, TOP_LEVEL, UNICORN_DLL, 'unicorn.dll', (CAPSTONE_DLL,),
+                 'pe', False)
+MACOS = Layout('macos',
+               ('contents/macos/digiemu', 'contents/macos/digiemu-console'),
+               ('contents',),
+               'contents/frameworks/unicorn/lib/libunicorn.2.dylib', 'libunicorn.2.dylib',
+               ('contents/frameworks/capstone/lib/libcapstone.dylib',
+                'contents/frameworks/capstone/lib/libcapstone.5.dylib'),
+               'macho', True)
+LINUX = Layout('linux',
+               ('digiemu', 'digiemu-console'),
+               ('digiemu', 'digiemu-console', CONTENTS),
+               CONTENTS + '/unicorn/lib/libunicorn.so.2', 'libunicorn.so.2',
+               (CONTENTS + '/capstone/lib/libcapstone.so', CONTENTS + '/capstone/lib/libcapstone.so.5'),
+               'elf', False)
+LAYOUTS = {l.name: l for l in (WINDOWS, MACOS, LINUX)}
+
+
+def host_layout(platform=None):
+    """-> the Layout for this (or the given sys.platform) host."""
+    platform = sys.platform if platform is None else platform
+    if platform == 'win32':
+        return WINDOWS
+    if platform == 'darwin':
+        return MACOS
+    return LINUX
+
 # Firmware and firmware-derived files. '.img.' also catches the card copies
 # (plusdrive.img.before-samples), '.snap.' half-written snapshots.
 DENY_SUFFIXES = ('.syx', '.snap', '.img', '.wav', '.pdf')
 DENY_PARTS = ('sections', 'snapshots', 'firmware', 'out', 'portable')
-DENY_NAMES = ('.source-sha256', '.ladder.json', 'firmware.json', 'unicorn.lib')
+DENY_NAMES = ('.source-sha256', '.ladder.json', 'firmware.json', 'unicorn.lib', 'libunicorn.a')
 DENY_PREFIXES = ('plusdrive', 'unicorn.dll.')
 SYSEX = b'\xf0\x00\x20\x3c'                         # F0, Elektron's manufacturer id
 
@@ -325,8 +374,28 @@ def describe_guard_cf(name, result):
                                                a['dll_characteristics'], b['checksum'], a['checksum']))
 
 
-def exe_problem(path, rel):
-    """-> why the exe at `path` cannot run the emulator, or None."""
+MACHO_MAGICS = (b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe',   # 64- and 32-bit, little-endian host
+               b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca')   # fat (universal)
+ELF_MAGIC = b'\x7fELF'
+
+
+def exe_problem(path, rel, check='pe'):
+    """-> why the exe at `path` cannot run the emulator, or None.
+
+    'pe': a Windows exe without Control Flow Guard and with a right checksum.
+    'macho' / 'elf': the file is a Mach-O or ELF image at all (PyInstaller's
+    bootloader on those platforms needs no fixing up)."""
+    if check in ('macho', 'elf'):
+        try:
+            with open(path, 'rb') as fh:
+                head = fh.read(4)
+        except OSError as exc:
+            return '%s: %s' % (rel, exc)
+        ok = head in MACHO_MAGICS if check == 'macho' else head == ELF_MAGIC
+        if not ok:
+            return '%s: not a %s executable (starts with %r)' % (
+                rel, 'Mach-O' if check == 'macho' else 'ELF', head)
+        return None
     try:
         with open(path, 'rb') as fh:
             info = pe_info(fh.read())
@@ -342,27 +411,48 @@ def exe_problem(path, rel):
     return None
 
 
+def _link_inside(path, dist):
+    """-> the link's bundle-relative target when it stays inside dist, else None."""
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return None
+    if os.path.isabs(target):
+        return None
+    resolved = os.path.normpath(os.path.join(os.path.dirname(path), target))
+    root = os.path.abspath(dist)
+    if os.path.commonpath([os.path.abspath(resolved), root]) != root:
+        return None
+    if resolved == root:
+        return None
+    return os.path.relpath(resolved, root).replace(os.sep, '/')
+
+
 def audit(dist, devices_dir=None, unicorn_sha256=None, lister=None,
-          require_pyz=False, max_bytes=MAX_BYTES, required=REQUIRED_MODULES):
+          require_pyz=False, max_bytes=MAX_BYTES, required=REQUIRED_MODULES,
+          layout=WINDOWS):
     """-> (files, problems). `files` are the bundle-relative paths ('/'
     separated, sorted) that make_zip() may write; any problem means none.
 
-    dist is the COLLECT folder (dist/digiemu). Both exes must be PE images
+    dist is the COLLECT folder (dist/digiemu), or digiemu.app for the macOS
+    layout. Both exes must pass the layout's exe check: on Windows, PE images
     without Control Flow Guard and with a correct PE checksum (see
-    clear_guard_cf). unicorn_sha256, when given, must match
-    _internal/unicorn/lib/unicorn.dll. lister maps an exe path to its
-    archive entry names (pyinstaller_lister()); with require_pyz set, not
-    having one is itself a problem. When the archives can be listed, each
-    exe's must hold no private module and every name in `required`."""
+    clear_guard_cf). unicorn_sha256, when given, must match the layout's one
+    Unicorn library. lister maps an exe path to its archive entry names
+    (pyinstaller_lister()); with require_pyz set, not having one is itself a
+    problem. When the archives can be listed, each exe's must hold no
+    private module and every name in `required`. A layout that allows links
+    accepts a relative symlink whose target stays inside dist; it is listed
+    in `files` and make_zip() writes it as a link."""
     problems = []
     if not os.path.isdir(dist):
         return [], ['%s: no such folder' % dist]
     top = sorted(os.listdir(dist))
     for n in top:
-        if n.lower() not in TOP_LEVEL:
+        if n.lower() not in layout.top_level:
             problems.append('%s: unexpected top-level entry (only %s belong there)'
-                            % (n, ', '.join(TOP_LEVEL)))
-    for n in TOP_LEVEL:
+                            % (n, ', '.join(layout.top_level)))
+    for n in layout.top_level:
         if n not in [t.lower() for t in top]:
             problems.append('%s: missing' % n)
 
@@ -370,14 +460,34 @@ def audit(dist, devices_dir=None, unicorn_sha256=None, lister=None,
     files, total, unicorns = [], 0, []
     for here, dirs, names in os.walk(dist):
         for d in list(dirs):
-            if _is_link(os.path.join(here, d)):
-                problems.append('%s: link or junction' % os.path.relpath(os.path.join(here, d), dist))
+            full = os.path.join(here, d)
+            if _is_link(full):
+                rel = os.path.relpath(full, dist).replace(os.sep, '/')
+                # PyInstaller links whole folders between Contents/Frameworks
+                # and Contents/Resources (licenses, patches, _tcl_data). One
+                # that stays inside the bundle is shipped as a link; what it
+                # points at is audited where it really is.
+                if layout.links and _link_inside(full, dist) is not None:
+                    why = path_problem(rel)
+                    if why:
+                        problems.append(why)
+                    else:
+                        files.append(rel)
+                else:
+                    problems.append('%s: link or junction' % rel)
                 dirs.remove(d)
         dirs.sort()
         for n in sorted(names):
             full = os.path.join(here, n)
             rel = os.path.relpath(full, dist).replace(os.sep, '/')
             if _is_link(full):
+                if layout.links and _link_inside(full, dist) is not None:
+                    why = path_problem(rel)
+                    if why:
+                        problems.append(why)
+                    else:
+                        files.append(rel)
+                    continue
                 problems.append('%s: link or junction' % rel)
                 continue
             why = path_problem(rel)
@@ -392,30 +502,34 @@ def audit(dist, devices_dir=None, unicorn_sha256=None, lister=None,
             if sha in bad_hashes:
                 problems.append('%s: is a firmware release listed in %s' % (rel, devices_dir))
                 continue
-            if rel.lower() in EXES:
-                why = exe_problem(full, rel)
+            if rel.lower() in layout.exes:
+                why = exe_problem(full, rel, layout.exe_check)
                 if why:
                     problems.append(why)
-            if n.lower() == 'unicorn.dll':
+            if n.lower() == layout.unicorn_name:
                 unicorns.append((rel, sha))
             files.append(rel)
 
-    if [r.lower() for r, _ in unicorns] != [UNICORN_DLL]:
-        problems.append('unicorn.dll: expected exactly %s, found %r'
-                        % (UNICORN_DLL, [r for r, _ in unicorns]))
+    if [r.lower() for r, _ in unicorns] != [layout.unicorn_lib]:
+        problems.append('%s: expected exactly %s, found %r'
+                        % (layout.unicorn_name, layout.unicorn_lib, [r for r, _ in unicorns]))
     elif unicorn_sha256 and unicorns[0][1] != unicorn_sha256.lower():
         problems.append('%s: sha256 %s, expected the patched build %s'
-                        % (UNICORN_DLL, unicorns[0][1], unicorn_sha256.lower()))
-    if CAPSTONE_DLL not in [f.lower() for f in files]:
-        problems.append('%s: missing' % CAPSTONE_DLL)
+                        % (layout.unicorn_lib, unicorns[0][1], unicorn_sha256.lower()))
+    lower = [f.lower() for f in files]
+    if not any(c in lower for c in layout.capstone_libs):
+        problems.append('%s: missing' % layout.capstone_libs[0])
     if total > max_bytes:
         problems.append('bundle is %d bytes, over the %d budget' % (total, max_bytes))
 
     if lister is None and require_pyz:
         problems.append('cannot list the exe archives (PyInstaller not importable)')
     elif lister is not None:
-        for exe in EXES:
-            path = os.path.join(dist, exe)
+        for exe in layout.exes:
+            # The layout names are lower-case; find the real spelling.
+            hits = [f for f in files if f.lower() == exe]
+            exe = hits[0] if hits else exe
+            path = os.path.join(dist, *exe.split('/'))
             if not os.path.isfile(path):
                 continue
             try:
@@ -444,7 +558,17 @@ def make_zip(dist, files, out, arcroot='digiemu'):
     tmp = out + '.tmp'
     with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for rel in files:
-            zf.write(os.path.join(dist, *rel.split('/')), arcroot + '/' + rel)
+            src = os.path.join(dist, *rel.split('/'))
+            if os.path.islink(src):
+                # A symlink entry: Unix mode S_IFLNK in the external
+                # attributes and the target as the data, which unzip, ditto
+                # and the Finder's Archive Utility all restore as a link.
+                zi = zipfile.ZipInfo(arcroot + '/' + rel)
+                zi.create_system = 3
+                zi.external_attr = (stat.S_IFLNK | 0o755) << 16
+                zf.writestr(zi, os.readlink(src))
+                continue
+            zf.write(src, arcroot + '/' + rel)
     os.replace(tmp, out)
     return out
 
@@ -458,9 +582,11 @@ def main(argv=None):
                     help='fail if the exe archives cannot be listed')
     ap.add_argument('--zip', metavar='OUT', help='write OUT.zip if the audit is clean')
     ap.add_argument('--arcroot', default='digiemu', help='folder name inside the zip')
+    ap.add_argument('--layout', choices=sorted(LAYOUTS), default='windows',
+                    help='the bundle shape to expect (default: windows)')
     args = ap.parse_args(argv)
     files, problems = audit(args.dist, args.devices, args.unicorn_sha256,
-                            pyinstaller_lister(), args.require_pyz)
+                            pyinstaller_lister(), args.require_pyz, layout=LAYOUTS[args.layout])
     for p in problems:
         print('REFUSED: %s' % p)
     if problems:
