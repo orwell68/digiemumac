@@ -32,6 +32,29 @@ side by side.
 The exe is not code-signed, so Windows shows a SmartScreen prompt the first
 time, and a PC with Smart App Control turned on blocks it.
 
+## Quick start (macOS, Apple Silicon)
+
+1. Download `digiemu-macos-arm64-<version>.zip` from
+   [Releases](https://github.com/irpina/digiemu/releases). Double-click it
+   to unpack `digiemu.app`, and drag that into Applications (or leave it
+   where it is).
+2. Get the firmware from Elektron's website, as above.
+3. Open `digiemu.app`. The first time, macOS says it cannot check the app
+   for malicious software, because it is signed by its build and not by an
+   Apple Developer ID: click **Done**, open **System Settings > Privacy &
+   Security**, scroll down and click **Open Anyway** next to digiemu, then
+   open it again. (On macOS 14 and earlier, Control-click the app and choose
+   **Open** instead.) macOS asks this once.
+4. Click **Add firmware**, pick the `.syx`, and when it says the firmware is
+   ready, click **Play**.
+
+An M1 sets a firmware up in well under the desktop's 25 seconds. Audio goes
+to the system's default output through AudioToolbox; there is nothing to
+install. The app keeps its data in `~/Library/Application Support/digiemu`
+(the **Open folder** buttons show it in the Finder), not next to the app, so
+it can live in Applications like any other app. An Intel Mac needs a build
+of its own from source (below); there is no Intel zip yet.
+
 ## Using the panel
 
 - **Keys:** click to press. **Shift-click latches** a key, for combinations
@@ -71,8 +94,9 @@ restarts.
 
 Everything lives next to the exe, in `firmware\<name>\`: your `.syx`, the
 +Drive image (`plusdrive.img`), the snapshots and the logs. You can move or
-copy the whole digiemu folder. **Do not share anything inside `firmware\`:**
-it is derived from Elektron's firmware.
+copy the whole digiemu folder. On macOS the same folders are in
+`~/Library/Application Support/digiemu/firmware/`. **Do not share anything
+inside `firmware`:** it is derived from Elektron's firmware.
 
 - **Rebuild** starts the firmware again from its +Drive as it is now. Your
   projects and samples stay; the saved session does not.
@@ -96,6 +120,10 @@ digiemu-console.exe --check FILE.syx         check a build before you flash it (
 `--home DIR` uses another data folder. Setting up takes about 23 seconds on
 the reference desktop, or about 13 seconds on a +Drive that already holds
 the factory content.
+
+On macOS the console program is inside the app bundle, so it is
+`/Applications/digiemu.app/Contents/MacOS/digiemu-console` (wherever you put
+the app) with the same options.
 
 ### Checking a custom build before you flash it
 
@@ -158,7 +186,9 @@ for live audio; the Digitone also uses most of a second core.
 
 You need Python 3.12 (with [uv](https://docs.astral.sh/uv/)), a C toolchain
 to build the patched Unicorn engine ([docs/UNICORN.md](docs/UNICORN.md)), and
-your own `.syx`. Tested on Windows 11 and on Linux (WSL2).
+your own `.syx`. Tested on Windows 11, on Linux (WSL2) and on macOS
+(Apple Silicon; `xcode-select --install` and `brew install cmake` give the
+toolchain).
 
 ```sh
 uv sync
@@ -190,6 +220,25 @@ under it; the process then has the same protections as `python.exe`), and
 runs a self-test of both exes before it writes the zip. The script's header
 and [packaging/](packaging/) explain each step.
 
+### Building the macOS app
+
+```sh
+tools/build-macos.sh --out ../build-out      # [--build-venv ../.venv-build] [--version x.y.z]
+```
+
+It makes `digiemu.app` with PyInstaller from
+[packaging/digiemu-mac.spec](packaging/digiemu-mac.spec), bundling the
+patched Unicorn from this checkout's `.venv`, then runs the frozen self-test
+of both executables in the bundle, audits it with
+`packaging/bundle_guard.py --layout macos`, and writes
+`digiemu-macos-<arch>-<version>.zip`. The build tools come from
+`requirements-build-macos.txt`. The app is ad-hoc signed (what PyInstaller
+does on macOS), which is why Gatekeeper asks once; signing with a Developer
+ID and notarising would remove that step and are not done here. On an Intel
+Mac the same command makes an x86_64 zip. The same script also runs on
+Linux, where it makes a plain folder rather than an app, which is how the
+spec is exercised without a Mac.
+
 ### Releasing
 
 Releases are built by GitHub Actions
@@ -199,15 +248,17 @@ Releases are built by GitHub Actions
    the release notes as `docs/releases/vX.Y.Z.md`. Then merge it.
 2. Tag the merge commit and push the tag:
    `git tag vX.Y.Z origin/main && git push origin vX.Y.Z`.
-3. On a Windows runner, the workflow checks that the tag matches
-   `APP_VERSION`, builds the patched Unicorn from source, and runs
-   `tools/build-windows.ps1` with the build tools pinned in
-   `requirements-build.txt`. It then attaches the zip and `SHA256SUMS.txt`
-   to a **draft** release for the tag.
+3. The workflow checks that the tag matches `APP_VERSION`, then builds the
+   patched Unicorn from source and the app on each platform: on a Windows
+   runner with `tools/build-windows.ps1` (build tools pinned in
+   `requirements-build.txt`), and on an Apple Silicon macOS runner with
+   `tools/build-macos.sh` (`requirements-build-macos.txt`). It then
+   attaches both zips and one `SHA256SUMS.txt` to a **draft** release for
+   the tag.
 4. Review the draft and publish it.
 
-A pull request that changes the build runs the same build without
-releasing anything, and keeps the zip as a workflow artifact.
+A pull request that changes the build runs the same builds without
+releasing anything, and keeps the zips as workflow artifacts.
 
 ### Tests
 

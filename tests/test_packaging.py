@@ -635,6 +635,58 @@ class EntryTest(unittest.TestCase):
                 mock.patch.object(sys, 'executable', exe), \
                 mock.patch.dict(os.environ, {'DIGIEMU_HOME': 'ignored'}):
             self.assertEqual(entry.app_root(), os.path.dirname(exe))
+        # The macOS app: the same answer emu.portable.app_root gives.
+        app = os.path.join(os.path.abspath(os.sep), 'Applications', 'digiemu.app')
+        mac_exe = os.path.join(app, 'Contents', 'MacOS', 'digiemu')
+        support = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'digiemu')
+        with mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(sys, 'executable', mac_exe), \
+                mock.patch.object(sys, 'platform', 'darwin'):
+            self.assertTrue(entry.in_mac_app_bundle())
+            self.assertEqual(entry.app_root(), support)
+        with mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(sys, 'executable', mac_exe), \
+                mock.patch.object(sys, 'platform', 'linux'):
+            self.assertFalse(entry.in_mac_app_bundle())
+            self.assertEqual(entry.app_root(), os.path.dirname(mac_exe))
+
+    @unittest.skipUnless(os.path.exists(os.devnull) and os.name == 'posix', 'needs /dev/null')
+    def test_mac_app_treats_devnull_streams_as_absent(self):
+        app = os.path.join(os.path.abspath(os.sep), 'Applications', 'digiemu.app')
+        mac_exe = os.path.join(app, 'Contents', 'MacOS', 'digiemu')
+        with tempfile.TemporaryDirectory() as home, \
+                open(os.devnull, 'w') as null_out, open(os.devnull, 'w') as null_err, \
+                mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(sys, 'executable', mac_exe), \
+                mock.patch.object(sys, 'platform', 'darwin'), \
+                mock.patch.object(entry, 'app_root', return_value=home), \
+                mock.patch.object(entry, '_log', None):
+            saved = sys.stdout, sys.stderr
+            try:
+                sys.stdout, sys.stderr = null_out, null_err
+                entry.setup_stdio(['--list'])
+                self.assertIsNot(sys.stdout, null_out)
+                self.assertTrue(os.path.isfile(os.path.join(home, 'logs', 'launcher.log')))
+                entry._log.close()
+                # A worker keeps what the launcher gave it.
+                sys.stdout, sys.stderr = null_out, null_err
+                entry.setup_stdio(['--worker', 'panel', 'x'])
+                self.assertIs(sys.stdout, null_out)
+            finally:
+                sys.stdout, sys.stderr = saved
+        # Outside an .app, /dev/null streams are left alone (as on Windows,
+        # where a real null handle is not None either).
+        with open(os.devnull, 'w') as null_out, \
+                mock.patch.object(sys, 'frozen', True, create=True), \
+                mock.patch.object(sys, 'executable', os.path.join(os.sep, 'dist', 'digiemu', 'digiemu')), \
+                mock.patch.object(sys, 'platform', 'darwin'):
+            saved = sys.stdout, sys.stderr
+            try:
+                sys.stdout = sys.stderr = null_out
+                entry.setup_stdio(['--list'])
+                self.assertIs(sys.stdout, null_out)
+            finally:
+                sys.stdout, sys.stderr = saved
 
     def test_windowed_stdio_goes_to_the_log_in_utf8(self):
         with tempfile.TemporaryDirectory() as home:

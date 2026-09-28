@@ -1,0 +1,9 @@
+# The macOS app's build tools, for tools/build-macos.sh's build venv (and the
+# release workflow's macos job). The same PyInstaller as requirements-build.txt;
+# macholib is PyInstaller's macOS dependency, and pefile/pywin32-ctypes are
+# Windows only.
+pyinstaller==6.19.0
+pyinstaller-hooks-contrib==2026.4
+altgraph==0.17.5
+macholib==1.16.3
+packaging==26.0
