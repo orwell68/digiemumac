@@ -460,8 +460,21 @@ def audit(dist, devices_dir=None, unicorn_sha256=None, lister=None,
     files, total, unicorns = [], 0, []
     for here, dirs, names in os.walk(dist):
         for d in list(dirs):
-            if _is_link(os.path.join(here, d)):
-                problems.append('%s: link or junction' % os.path.relpath(os.path.join(here, d), dist))
+            full = os.path.join(here, d)
+            if _is_link(full):
+                rel = os.path.relpath(full, dist).replace(os.sep, '/')
+                # PyInstaller links whole folders between Contents/Frameworks
+                # and Contents/Resources (licenses, patches, _tcl_data). One
+                # that stays inside the bundle is shipped as a link; what it
+                # points at is audited where it really is.
+                if layout.links and _link_inside(full, dist) is not None:
+                    why = path_problem(rel)
+                    if why:
+                        problems.append(why)
+                    else:
+                        files.append(rel)
+                else:
+                    problems.append('%s: link or junction' % rel)
                 dirs.remove(d)
         dirs.sort()
         for n in sorted(names):

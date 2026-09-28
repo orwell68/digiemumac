@@ -64,6 +64,10 @@ def make_app(root):
     _link(app, 'Contents/Resources/capstone/lib/libcapstone.dylib',
           '../../../Frameworks/capstone/lib/libcapstone.dylib')
     _link(app, 'Contents/Resources/base_library.zip', '../Frameworks/base_library.zip')
+    # Whole folders are linked too (PyInstaller does this for licenses/,
+    # patches/, _tcl_data/ and _tk_data/).
+    _put(app, 'Contents/Resources/licenses/python/LICENSE.txt', b'PSF')
+    _link(app, 'Contents/Frameworks/licenses', '../Resources/licenses')
     return app
 
 
@@ -91,6 +95,9 @@ class MacLayout(unittest.TestCase):
         self.assertIn('Contents/Frameworks/unicorn/lib/libunicorn.2.dylib', files)
         self.assertIn('Contents/Resources/unicorn/lib/libunicorn.2.dylib', files)   # the link
         self.assertIn('Contents/Frameworks/devices/digitakt.toml', files)           # the link
+        self.assertIn('Contents/Frameworks/licenses', files)                        # a folder link
+        self.assertIn('Contents/Resources/licenses/python/LICENSE.txt', files)
+        self.assertNotIn('Contents/Frameworks/licenses/python/LICENSE.txt', files)  # not walked twice
 
     def test_archives_checked_with_layout_paths(self):
         seen = []
@@ -115,6 +122,12 @@ class MacLayout(unittest.TestCase):
         _put(self.app, 'Contents/MacOS/digiemu', b'#!/bin/sh\n')
         _files, problems = self.audit()
         self.assertTrue(any('not a Mach-O executable' in p for p in problems))
+
+    def test_folder_link_out_of_the_bundle_refused(self):
+        os.makedirs(os.path.join(self.tmp.name, 'elsewhere'))
+        _link(self.app, 'Contents/Resources/loot', '../../../elsewhere')
+        _files, problems = self.audit()
+        self.assertTrue(any('loot: link' in p for p in problems))
 
     def test_link_out_of_the_bundle_refused(self):
         outside = _put(self.tmp.name, 'elsewhere/Digitakt_OS1.53.syx', b'\xf0\x00\x20\x3c')
@@ -157,6 +170,9 @@ class MacLayout(unittest.TestCase):
             link = zf.getinfo('digiemu.app/Contents/Resources/unicorn/lib/libunicorn.2.dylib')
             self.assertTrue(stat.S_ISLNK(link.external_attr >> 16))
             self.assertEqual(zf.read(link).decode(), '../../../Frameworks/unicorn/lib/libunicorn.2.dylib')
+            folder = zf.getinfo('digiemu.app/Contents/Frameworks/licenses')
+            self.assertTrue(stat.S_ISLNK(folder.external_attr >> 16))
+            self.assertEqual(zf.read(folder).decode(), '../Resources/licenses')
             exe = zf.getinfo('digiemu.app/Contents/MacOS/digiemu')
             self.assertEqual((exe.external_attr >> 16) & 0o777, 0o755)
             self.assertEqual(zf.read(exe), MACHO64)
